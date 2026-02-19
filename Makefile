@@ -8,6 +8,11 @@ EXT_CONFIG = ${PROJ_DIR}extension_config.cmake
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
+# Flock: install system deps for tidy-check (CI doesn't use vcpkg for code quality)
+install-tidy-deps:
+	@sudo apt-get update -y -qq && sudo apt-get install -y -qq libcurl4-openssl-dev nlohmann-json3-dev
+tidy-check: install-tidy-deps
+
 # Color codes
 RESET = \033[0m
 BOLD = \033[1m
