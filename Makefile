@@ -10,7 +10,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # Flock: install system deps for tidy-check (CI doesn't use vcpkg for code quality)
 install-tidy-deps:
-	@sudo apt-get update -y -qq && sudo apt-get install -y -qq libcurl4-openssl-dev nlohmann-json3-dev
+	@sudo apt-get update -y -qq && sudo apt-get install -y -qq libcurl4-openssl-dev nlohmann-json3-dev libgtest-dev libgmock-dev
 tidy-check: install-tidy-deps
 
 # Color codes
