@@ -15,9 +15,20 @@ project(${TARGET_NAME})
 include_directories(src/include)
 add_subdirectory(src)
 
-# Find dependencies
-find_package(CURL REQUIRED)
-find_package(nlohmann_json CONFIG REQUIRED)
+# Find dependencies (optional when CLANG_TIDY - uses stubs if not found)
+if(CLANG_TIDY)
+  find_package(CURL)
+  find_package(nlohmann_json CONFIG)
+  if(NOT CURL_FOUND)
+    add_library(CURL::libcurl INTERFACE)
+  endif()
+  if(NOT nlohmann_json_FOUND)
+    add_library(nlohmann_json::nlohmann_json INTERFACE)
+  endif()
+else()
+  find_package(CURL REQUIRED)
+  find_package(nlohmann_json CONFIG REQUIRED)
+endif()
 
 # Build the DuckDB static and loadable extensions
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
