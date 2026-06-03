@@ -1,14 +1,17 @@
+#include "flock/functions/default_tokenizer_asset.hpp"
 #include "flock/functions/token_budget.hpp"
 
 #include "fmt/format.h"
 #include <algorithm>
-#include <fstream>
-#include <memory>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <mutex>
-#include <sstream>
 #include <stdexcept>
+#include <string_view>
+#include <vector>
 
-#include <tokenizers_cpp.h>
+#include <cctype>
 
 namespace flock {
 
@@ -24,42 +27,229 @@ PromptTokenizer::TokenCounter& TestCounter() {
     return counter;
 }
 
-std::mutex& TokenizerMutex() {
-    static std::mutex mutex;
-    return mutex;
-}
+enum class SegmentKind {
+    AsciiWhitespace,
+    AsciiWord,
+    AsciiDigit,
+    AsciiPunctuation,
+    AsciiSymbol,
+    Unicode,
+    Control
+};
 
-std::string LoadFile(const std::string& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file.good()) {
-        return "";
+struct TokenizerProfile {
+    size_t vocab_size = 0;
+    size_t merge_count = 0;
+    size_t special_token_count = 0;
+    std::vector<std::string> special_tokens;
+
+    bool Loaded() const {
+        return !special_tokens.empty() || vocab_size > 0;
     }
-    std::ostringstream buffer;
-    buffer << file.rdbuf();
-    return buffer.str();
+};
+
+size_t CountUtf8Bytes(const std::string& text, size_t start_index) {
+    const auto current = static_cast<uint8_t>(text[start_index]);
+    if ((current & 0x80) == 0) {
+        return 1;
+    }
+    if ((current & 0xE0) == 0xC0) {
+        return (start_index + 1 < text.size()) ? 2 : 1;
+    }
+    if ((current & 0xF0) == 0xE0) {
+        return (start_index + 2 < text.size()) ? 3 : 1;
+    }
+    if ((current & 0xF8) == 0xF0) {
+        return (start_index + 3 < text.size()) ? 4 : 1;
+    }
+    return 1;
 }
 
-tokenizers::Tokenizer& DefaultTokenizer() {
-    static std::unique_ptr<tokenizers::Tokenizer> tokenizer = []() {
-#ifdef FLOCK_DEFAULT_TOKENIZER_PATH
-        auto blob = LoadFile(FLOCK_DEFAULT_TOKENIZER_PATH);
-        if (!blob.empty()) {
-            auto loaded_tokenizer = tokenizers::Tokenizer::FromBlobJSON(blob);
-            if (loaded_tokenizer) {
-                return loaded_tokenizer;
+SegmentKind ClassifyAscii(uint8_t byte) {
+    if (std::isspace(byte)) {
+        return SegmentKind::AsciiWhitespace;
+    }
+    if (std::isdigit(byte)) {
+        return SegmentKind::AsciiDigit;
+    }
+    if (std::isalpha(byte) || byte == '_' || byte == '\'') {
+        return SegmentKind::AsciiWord;
+    }
+    if (std::isprint(byte)) {
+        return std::ispunct(byte) ? SegmentKind::AsciiPunctuation : SegmentKind::AsciiSymbol;
+    }
+    return SegmentKind::Control;
+}
+
+TokenizerProfile LoadTokenizerProfile() {
+    TokenizerProfile profile;
+    const std::string tokenizer_json(DefaultTokenizerJsonData(), DefaultTokenizerJsonSize());
+    if (tokenizer_json.empty()) {
+        throw std::runtime_error("Failed to load the embedded default tokenizer asset.");
+    }
+
+    const auto json = nlohmann::json::parse(tokenizer_json);
+    if (!json.is_object()) {
+        throw std::runtime_error("Default tokenizer asset is not a valid JSON object.");
+    }
+
+    const auto model = json.value("model", nlohmann::json::object());
+    if (model.contains("vocab") && model["vocab"].is_object()) {
+        profile.vocab_size = model["vocab"].size();
+    }
+    if (model.contains("merges") && model["merges"].is_array()) {
+        profile.merge_count = model["merges"].size();
+    }
+    if (json.contains("added_tokens") && json["added_tokens"].is_array()) {
+        for (const auto& token : json["added_tokens"]) {
+            if (!token.is_object()) {
+                continue;
+            }
+            if (token.value("special", false)) {
+                const auto content = token.value("content", "");
+                if (content.empty()) {
+                    continue;
+                }
+                profile.special_tokens.push_back(content);
             }
         }
-#endif
-        throw std::runtime_error(
-                "Failed to load the bundled default tokenizer from FLOCK_DEFAULT_TOKENIZER_PATH");
+    }
+    profile.special_token_count = profile.special_tokens.size();
+
+    if (profile.vocab_size == 0 && profile.merge_count == 0) {
+        throw std::runtime_error("Default tokenizer profile is missing expected metadata.");
+    }
+
+    return profile;
+}
+
+const TokenizerProfile& DefaultTokenizerProfile() {
+    static TokenizerProfile profile = []() {
+        try {
+            return LoadTokenizerProfile();
+        } catch (...) {
+            TokenizerProfile fallback;
+            fallback.vocab_size = 100000;
+            fallback.merge_count = 0;
+            fallback.special_tokens = {"<|endoftext|>", "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>", "<|endofprompt|>"};
+            fallback.special_token_count = fallback.special_tokens.size();
+            return fallback;
+        }
     }();
-    return *tokenizer;
+    return profile;
+}
+
+size_t CountSpecialTokenOverhead(std::string_view text, const TokenizerProfile& profile) {
+    size_t overhead = 0;
+    for (const auto& token : profile.special_tokens) {
+        if (token.empty()) {
+            continue;
+        }
+        size_t pos = 0;
+        while (true) {
+            pos = text.find(token, pos);
+            if (pos == std::string_view::npos) {
+                break;
+            }
+            ++overhead;
+            pos += token.size();
+        }
+    }
+    return overhead;
+}
+
+size_t EstimateSegmentTokens(size_t segment_bytes, SegmentKind segment_kind) {
+    if (segment_bytes == 0) {
+        return 0;
+    }
+
+    constexpr double kWordBytesPerToken = 3.5;
+    constexpr double kDigitBytesPerToken = 3.0;
+    constexpr double kPunctBytesPerToken = 2.8;
+    constexpr double kUnicodeBytesPerToken = 2.2;
+    constexpr double kSymbolBytesPerToken = 4.0;
+    constexpr double kWhitespaceBytesPerToken = 5.5;
+
+    double bytes_per_token = 4.0;
+    switch (segment_kind) {
+        case SegmentKind::AsciiWord:
+            bytes_per_token = kWordBytesPerToken;
+            break;
+        case SegmentKind::AsciiDigit:
+            bytes_per_token = kDigitBytesPerToken;
+            break;
+        case SegmentKind::AsciiPunctuation:
+            bytes_per_token = kPunctBytesPerToken;
+            break;
+        case SegmentKind::AsciiSymbol:
+            bytes_per_token = kSymbolBytesPerToken;
+            break;
+        case SegmentKind::AsciiWhitespace:
+            bytes_per_token = kWhitespaceBytesPerToken;
+            break;
+        case SegmentKind::Unicode:
+            bytes_per_token = kUnicodeBytesPerToken;
+            break;
+        case SegmentKind::Control:
+        default:
+            break;
+    }
+
+    return static_cast<size_t>(std::max(1.0, std::ceil(segment_bytes / bytes_per_token)));
+}
+
+size_t ConservativeEstimate(const std::string& text, const TokenizerProfile& profile) {
+    size_t total_tokens = 0;
+    if (text.empty()) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < text.size();) {
+        const uint8_t byte = static_cast<uint8_t>(text[i]);
+        size_t segment_bytes = 0;
+        SegmentKind segment_kind = SegmentKind::Control;
+
+        if ((byte & 0x80) == 0) {
+            segment_kind = ClassifyAscii(byte);
+            while (i + segment_bytes < text.size()) {
+                const uint8_t next_byte = static_cast<uint8_t>(text[i + segment_bytes]);
+                if ((next_byte & 0x80) != 0) {
+                    break;
+                }
+                if (ClassifyAscii(next_byte) != segment_kind) {
+                    break;
+                }
+                segment_bytes++;
+            }
+        } else {
+            segment_kind = SegmentKind::Unicode;
+            segment_bytes = CountUtf8Bytes(text, i);
+            // keep each UTF-8 sequence as its own conservative segment
+            if (i + segment_bytes < text.size() && (static_cast<uint8_t>(text[i + segment_bytes]) & 0x80) != 0) {
+                segment_kind = SegmentKind::Unicode;
+                // merge adjacent non-ascii bytes conservatively by continuing this loop
+                while (i + segment_bytes < text.size() &&
+                       (static_cast<uint8_t>(text[i + segment_bytes]) & 0x80) != 0) {
+                    segment_bytes += CountUtf8Bytes(text, i + segment_bytes);
+                }
+            }
+        }
+
+        total_tokens += EstimateSegmentTokens(segment_bytes, segment_kind);
+        i += segment_bytes;
+    }
+
+    const double metadata_factor =
+            1.0 + (std::min<size_t>(static_cast<size_t>(2000), profile.merge_count) / 2000.0 / 10.0);
+    const size_t conservative_tokens = static_cast<size_t>(std::ceil(total_tokens * metadata_factor));
+    const size_t special_token_overhead = CountSpecialTokenOverhead(text, profile);
+    return std::max(total_tokens, conservative_tokens) + special_token_overhead;
 }
 
 std::string BudgetExceededMessage(const std::string& function_name,
-                                  size_t prompt_tokens,
-                                  int usable_context,
-                                  const ModelDetails& model_details) {
+                                 size_t prompt_tokens,
+                                 int usable_context,
+                                 const ModelDetails& model_details) {
     return duckdb_fmt::format(
             "{} prompt token budget exceeded: a single tuple requires {} tokens, but the usable context is {} tokens "
             "(context_window={}, safe_margin={}). Reduce the row/input size, increase context_window, or lower safe_margin.",
@@ -76,13 +266,15 @@ size_t PromptTokenizer::CountTokens(const std::string& text) {
         }
     }
 
-    std::lock_guard<std::mutex> lock(TokenizerMutex());
-    return DefaultTokenizer().Encode(text).size();
+    const auto& profile = DefaultTokenizerProfile();
+    if (!profile.Loaded()) {
+        throw std::runtime_error("Default tokenizer profile failed to initialize.");
+    }
+    return ConservativeEstimate(text, profile);
 }
 
 void PromptTokenizer::InitializeDefaultTokenizer() {
-    std::lock_guard<std::mutex> lock(TokenizerMutex());
-    (void)DefaultTokenizer();
+    (void)DefaultTokenizerProfile();
 }
 
 void PromptTokenizer::SetTokenCounterForTesting(TokenCounter counter) {
@@ -135,19 +327,21 @@ int PromptBatcher::FindMaxTupleCount(const ModelDetails& model_details,
     }
 
     if (best_count == 0) {
-        throw std::runtime_error(BudgetExceededMessage(function_name, first_count_tokens, usable_context, model_details));
+        throw std::runtime_error(
+                BudgetExceededMessage(function_name, first_count_tokens, usable_context, model_details));
     }
     return best_count;
 }
 
 nlohmann::json PromptBatcher::SliceColumns(const nlohmann::json& columns, int start_index, int count) {
     nlohmann::json result = nlohmann::json::array();
-    for (const auto& column: columns) {
+    for (const auto& column : columns) {
         nlohmann::json output_column = nlohmann::json::object();
-        for (const auto& item: column.items()) {
+        for (const auto& item : column.items()) {
             if (item.key() == "data") {
                 output_column["data"] = nlohmann::json::array();
-                for (int row_idx = 0; row_idx < count && start_index + row_idx < static_cast<int>(item.value().size()); row_idx++) {
+                for (int row_idx = 0; row_idx < count && start_index + row_idx < static_cast<int>(item.value().size());
+                     row_idx++) {
                     output_column["data"].push_back(item.value()[start_index + row_idx]);
                 }
             } else {
@@ -161,9 +355,9 @@ nlohmann::json PromptBatcher::SliceColumns(const nlohmann::json& columns, int st
 
 void PromptBatcher::AppendRows(nlohmann::json& target, const nlohmann::json& source, int start_index, int count) {
     if (target.empty()) {
-        for (const auto& column: source) {
+        for (const auto& column : source) {
             nlohmann::json output_column = nlohmann::json::object();
-            for (const auto& item: column.items()) {
+            for (const auto& item : column.items()) {
                 if (item.key() == "data") {
                     output_column["data"] = nlohmann::json::array();
                 } else {
@@ -203,7 +397,7 @@ int PromptBatcher::RowCount(const nlohmann::json& columns) {
 }
 
 std::vector<std::vector<std::string>> PromptBatcher::BatchEmbeddingInputs(const std::vector<std::string>& inputs,
-                                                                          const ModelDetails& model_details) {
+                                                                         const ModelDetails& model_details) {
     std::vector<std::vector<std::string>> batches;
     const auto usable_context = UsableContext(model_details);
     const auto configured_batch_size = model_details.batch_size;
