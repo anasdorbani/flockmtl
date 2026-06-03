@@ -2,15 +2,13 @@
 
 #include "fmt/format.h"
 #include <algorithm>
-#include <cctype>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
 
-#ifdef FLOCK_ENABLE_TOKENIZERS_CPP
 #include <tokenizers_cpp.h>
-#endif
 
 namespace flock {
 
@@ -26,7 +24,6 @@ PromptTokenizer::TokenCounter& TestCounter() {
     return counter;
 }
 
-#ifdef FLOCK_ENABLE_TOKENIZERS_CPP
 std::mutex& TokenizerMutex() {
     static std::mutex mutex;
     return mutex;
@@ -41,45 +38,23 @@ std::string LoadFile(const std::string& path) {
     buffer << file.rdbuf();
     return buffer.str();
 }
-#endif
 
-size_t FallbackCountTokens(const std::string& text) {
-    if (text.empty()) {
-        return 0;
-    }
-
-    size_t tokens = 0;
-    bool in_word = false;
-    for (const unsigned char ch: text) {
-        if (std::isalnum(ch) || ch == '_') {
-            if (!in_word) {
-                tokens++;
-                in_word = true;
-            }
-        } else {
-            in_word = false;
-            if (!std::isspace(ch)) {
-                tokens++;
-            }
-        }
-    }
-    return std::max<size_t>(1, tokens);
-}
-
-#ifdef FLOCK_ENABLE_TOKENIZERS_CPP
-tokenizers::Tokenizer* DefaultTokenizer() {
+tokenizers::Tokenizer& DefaultTokenizer() {
     static std::unique_ptr<tokenizers::Tokenizer> tokenizer = []() {
 #ifdef FLOCK_DEFAULT_TOKENIZER_PATH
         auto blob = LoadFile(FLOCK_DEFAULT_TOKENIZER_PATH);
         if (!blob.empty()) {
-            return tokenizers::Tokenizer::FromBlobJSON(blob);
+            auto loaded_tokenizer = tokenizers::Tokenizer::FromBlobJSON(blob);
+            if (loaded_tokenizer) {
+                return loaded_tokenizer;
+            }
         }
 #endif
-        return std::unique_ptr<tokenizers::Tokenizer>();
+        throw std::runtime_error(
+                "Failed to load the bundled default tokenizer from FLOCK_DEFAULT_TOKENIZER_PATH");
     }();
-    return tokenizer.get();
+    return *tokenizer;
 }
-#endif
 
 std::string BudgetExceededMessage(const std::string& function_name,
                                   size_t prompt_tokens,
@@ -101,14 +76,13 @@ size_t PromptTokenizer::CountTokens(const std::string& text) {
         }
     }
 
-#ifdef FLOCK_ENABLE_TOKENIZERS_CPP
-    if (auto* tokenizer = DefaultTokenizer()) {
-        std::lock_guard<std::mutex> lock(TokenizerMutex());
-        return tokenizer->Encode(text).size();
-    }
-#endif
+    std::lock_guard<std::mutex> lock(TokenizerMutex());
+    return DefaultTokenizer().Encode(text).size();
+}
 
-    return FallbackCountTokens(text);
+void PromptTokenizer::InitializeDefaultTokenizer() {
+    std::lock_guard<std::mutex> lock(TokenizerMutex());
+    (void)DefaultTokenizer();
 }
 
 void PromptTokenizer::SetTokenCounterForTesting(TokenCounter counter) {

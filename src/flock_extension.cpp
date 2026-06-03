@@ -7,12 +7,14 @@
 #include "flock/core/common.hpp"
 #include "flock/core/config.hpp"
 #include "flock/custom_parser/query_parser.hpp"
+#include "flock/functions/token_budget.hpp"
 
 #include <flock/model_manager/model.hpp>
 
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader& loader) {
+    flock::PromptTokenizer::InitializeDefaultTokenizer();
     flock::Config::Configure(loader);
 
     // Register parser and binder hooks using extension registration APIs.

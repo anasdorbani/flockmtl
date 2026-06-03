@@ -14,6 +14,7 @@ target_link_libraries(${PROJECT_NAME}_tests PRIVATE
     GTest::gmock
     $<$<CXX_COMPILER_ID:GNU>:-Wl,--start-group>
     ${PROJECT_NAME}_extension
+    tokenizers_cpp
     duckdb_generated_extension_loader
     core_functions_extension
     json_extension

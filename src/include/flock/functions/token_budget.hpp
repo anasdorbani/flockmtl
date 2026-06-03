@@ -13,6 +13,7 @@ public:
     using TokenCounter = std::function<size_t(const std::string&)>;
 
     static size_t CountTokens(const std::string& text);
+    static void InitializeDefaultTokenizer();
     static void SetTokenCounterForTesting(TokenCounter counter);
 };
 
