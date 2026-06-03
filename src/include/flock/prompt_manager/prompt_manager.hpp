@@ -48,6 +48,7 @@ public:
 
     // Helper function to transcribe audio column and create transcription text column
     static nlohmann::json TranscribeAudioColumn(const nlohmann::json& audio_column);
+    static nlohmann::json PrepareColumnsForRender(const nlohmann::json& columns);
 
 public:
     template<typename FunctionType>

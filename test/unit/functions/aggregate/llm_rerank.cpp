@@ -4,6 +4,20 @@
 
 namespace flock {
 
+namespace {
+
+size_t CountOccurrences(const std::string& text, const std::string& needle) {
+    size_t count = 0;
+    size_t position = text.find(needle);
+    while (position != std::string::npos) {
+        count++;
+        position = text.find(needle, position + needle.size());
+    }
+    return count;
+}
+
+}// namespace
+
 class LLMRerankTest : public LLMAggregateTestBase<LlmRerank> {
 protected:
     static constexpr const char* LLM_RESPONSE = R"({"items":[0, 1, 2]})";
@@ -117,6 +131,42 @@ TEST_F(LLMRerankTest, DefaultBatchSizeSplitsLargeInput) {
     const auto results = con.Query(
             "SELECT llm_rerank("
             "{'model_name': 'gpt-4o'}, "
+            "{'prompt': 'Rank these products by relevance', 'context_columns': [{'data': description}]}"
+            ") AS reranked_products FROM range(" +
+            std::to_string(input_count) + ") AS t(i), "
+                                          "unnest(['Product description ' || i::VARCHAR]) AS products(description);");
+
+    ASSERT_FALSE(results->HasError()) << "Query failed: " << results->GetError();
+    ASSERT_EQ(results->RowCount(), 1);
+    nlohmann::json parsed = nlohmann::json::parse(results->GetValue(0, 0).GetValue<std::string>());
+    ASSERT_EQ(parsed.size(), 1);
+    EXPECT_EQ(parsed[0]["data"].size(), input_count);
+}
+
+TEST_F(LLMRerankTest, ContextWindowSplitsBeforeBatchSize) {
+    constexpr size_t input_count = 5;
+
+    PromptTokenizer::SetTokenCounterForTesting([](const std::string& prompt) {
+        return CountOccurrences(prompt, "Product description ");
+    });
+
+    {
+        ::testing::InSequence sequence;
+        EXPECT_CALL(*mock_provider, AddCompletionRequest(::testing::_, 3, ::testing::_, ::testing::_))
+                .Times(1);
+        EXPECT_CALL(*mock_provider, CollectCompletions(::testing::_))
+                .WillOnce(::testing::Return(std::vector<nlohmann::json>{PrepareSequentialRanking(3)}));
+        EXPECT_CALL(*mock_provider, AddCompletionRequest(::testing::_, 3, ::testing::_, ::testing::_))
+                .Times(1);
+        EXPECT_CALL(*mock_provider, CollectCompletions(::testing::_))
+                .WillOnce(::testing::Return(std::vector<nlohmann::json>{PrepareSequentialRanking(3)}));
+    }
+
+    auto con = GetConnection();
+
+    const auto results = con.Query(
+            "SELECT llm_rerank("
+            "{'model_name': 'gpt-4o', 'batch_size': 16, 'context_window': 3, 'safe_margin': 0}, "
             "{'prompt': 'Rank these products by relevance', 'context_columns': [{'data': description}]}"
             ") AS reranked_products FROM range(" +
             std::to_string(input_count) + ") AS t(i), "

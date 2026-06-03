@@ -9,6 +9,8 @@
 namespace flock {
 
 inline constexpr int DEFAULT_BATCH_SIZE = 16;
+inline constexpr int DEFAULT_CONTEXT_WINDOW = 8192;
+inline constexpr int DEFAULT_SAFE_MARGIN = 512;
 
 struct ModelDetails {
     std::string provider_name;
@@ -17,6 +19,8 @@ struct ModelDetails {
     std::unordered_map<std::string, std::string> secret;
     std::string tuple_format;
     int batch_size;
+    int context_window;
+    int safe_margin;
     nlohmann::json model_parameters;
 };
 

@@ -22,6 +22,14 @@ protected:
         con.Query("  CREATE SECRET ("
                   "       TYPE OLLAMA,"
                   "    API_URL '127.0.0.1:11434');");
+        con.Query("DELETE FROM flock_config.FLOCKMTL_MODEL_USER_DEFINED_INTERNAL_TABLE "
+                  "WHERE model_name IN ('gpt-4o-test', 'azure-gpt-4o-mini', 'gemma3:4b');");
+        con.Query("INSERT INTO flock_config.FLOCKMTL_MODEL_USER_DEFINED_INTERNAL_TABLE "
+                  "(model_name, model, provider_name, model_args) VALUES "
+                  "('gpt-4o-test', 'gpt-4o', 'openai', "
+                  "'{\"tuple_format\":\"json\",\"batch_size\":32,\"model_parameters\":{\"temperature\":0.7}}'), "
+                  "('azure-gpt-4o-mini', 'gpt-4o-mini', 'azure', '{}'), "
+                  "('gemma3:4b', 'gemma3:4b', 'ollama', '{}');");
     }
 
     void TearDown() override {
@@ -48,6 +56,8 @@ TEST_F(ModelManagerTest, ModelInitialization) {
         EXPECT_EQ(details.model_parameters, nlohmann::json::parse("{\"temperature\": 0.7}"));
         EXPECT_EQ(details.tuple_format, "json");
         EXPECT_EQ(details.batch_size, 32);
+        EXPECT_EQ(details.context_window, DEFAULT_CONTEXT_WINDOW);
+        EXPECT_EQ(details.safe_margin, DEFAULT_SAFE_MARGIN);
     });
 }
 
@@ -78,7 +88,41 @@ TEST_F(ModelManagerTest, ModelInitializationUsesDefaultBatchSizeWhenUnset) {
         EXPECT_EQ(details.model, "gpt-4o");
         EXPECT_EQ(details.provider_name, "openai");
         EXPECT_EQ(details.batch_size, DEFAULT_BATCH_SIZE);
+        EXPECT_EQ(details.context_window, DEFAULT_CONTEXT_WINDOW);
+        EXPECT_EQ(details.safe_margin, DEFAULT_SAFE_MARGIN);
     });
+}
+
+TEST_F(ModelManagerTest, ModelInitializationUsesConfiguredContextBudget) {
+    json model_config = {
+            {"model_name", "gpt-4o-test"},
+            {"model", "gpt-4o"},
+            {"provider", "openai"},
+            {"secret", {{"api_key", "your-api-key"}}},
+            {"tuple_format", "json"},
+            {"batch_size", 32},
+            {"context_window", 4096},
+            {"safe_margin", 256}};
+
+    Model model(model_config);
+    ModelDetails details = model.GetModelDetails();
+
+    EXPECT_EQ(details.context_window, 4096);
+    EXPECT_EQ(details.safe_margin, 256);
+}
+
+TEST_F(ModelManagerTest, ModelInitializationRejectsInvalidContextBudget) {
+    json invalid_model_config = {
+            {"model_name", "gpt-4o-test"},
+            {"model", "gpt-4o"},
+            {"provider", "openai"},
+            {"secret", {{"api_key", "your-api-key"}}},
+            {"tuple_format", "json"},
+            {"batch_size", 32},
+            {"context_window", 512},
+            {"safe_margin", 512}};
+
+    EXPECT_THROW(Model model(invalid_model_config), std::invalid_argument);
 }
 
 // Test Model initialization with invalid configuration
@@ -140,6 +184,8 @@ TEST_F(ModelManagerTest, GetModelDetails) {
     EXPECT_EQ(details.model_parameters, nlohmann::json::parse("{\"temperature\": 0.7}"));
     EXPECT_EQ(details.tuple_format, "XML");
     EXPECT_EQ(details.batch_size, 10);
+    EXPECT_EQ(details.context_window, DEFAULT_CONTEXT_WINDOW);
+    EXPECT_EQ(details.safe_margin, DEFAULT_SAFE_MARGIN);
 }
 
 }// namespace flock

@@ -2,6 +2,7 @@
 
 #include "../mock_provider.hpp"
 #include "flock/core/config.hpp"
+#include "flock/functions/token_budget.hpp"
 #include "flock/model_manager/model.hpp"
 #include "flock/model_manager/providers/provider.hpp"
 #include "nlohmann/json.hpp"

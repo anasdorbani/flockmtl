@@ -3,6 +3,20 @@
 
 namespace flock {
 
+namespace {
+
+size_t CountOccurrences(const std::string& text, const std::string& needle) {
+    size_t count = 0;
+    size_t position = text.find(needle);
+    while (position != std::string::npos) {
+        count++;
+        position = text.find(needle, position + needle.size());
+    }
+    return count;
+}
+
+}// namespace
+
 class LLMFirstTest : public LLMAggregateTestBase<LlmFirstOrLast> {
 protected:
     static constexpr const char* LLM_RESPONSE = R"({"items":[0]})";
@@ -106,6 +120,35 @@ TEST_F(LLMFirstTest, DefaultBatchSizeSplitsLargeInput) {
     nlohmann::json parsed = nlohmann::json::parse(results->GetValue(0, 0).GetValue<std::string>());
     EXPECT_EQ(parsed.size(), 1);
     EXPECT_EQ(parsed[0]["data"].size(), 1);
+}
+
+TEST_F(LLMFirstTest, ContextWindowSplitsBeforeBatchSize) {
+    constexpr size_t input_count = 4;
+
+    PromptTokenizer::SetTokenCounterForTesting([](const std::string& prompt) {
+        return CountOccurrences(prompt, "Product description ");
+    });
+
+    EXPECT_CALL(*mock_provider, AddCompletionRequest(::testing::_, 1, ::testing::_, ::testing::_))
+            .Times(3);
+    EXPECT_CALL(*mock_provider, CollectCompletions(::testing::_))
+            .Times(3)
+            .WillRepeatedly(::testing::Return(std::vector<nlohmann::json>{GetExpectedJsonResponse()}));
+
+    auto con = GetConnection();
+
+    const auto results = con.Query(
+            "SELECT llm_first("
+            "{'model_name': 'gpt-4o', 'batch_size': 16, 'context_window': 2, 'safe_margin': 0}, "
+            "{'prompt': 'What is the most relevant product?', 'context_columns': [{'data': description}]}"
+            ") AS first_product FROM range(" +
+            std::to_string(input_count) + ") AS t(i), "
+                                          "unnest(['Product description ' || i::VARCHAR]) AS products(description);");
+
+    ASSERT_FALSE(results->HasError()) << "Query failed: " << results->GetError();
+    ASSERT_EQ(results->RowCount(), 1);
+    nlohmann::json parsed = nlohmann::json::parse(results->GetValue(0, 0).GetValue<std::string>());
+    EXPECT_EQ(parsed[0]["data"][0], "Product description 0");
 }
 
 // Test GROUP BY with multiple tuples per group: LLM is called for each group

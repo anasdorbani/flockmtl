@@ -1,8 +1,10 @@
 #include "flock/core/config.hpp"
 #include "flock/functions/aggregate/llm_rerank.hpp"
 #include "flock/functions/llm_function_bind_data.hpp"
+#include "flock/functions/token_budget.hpp"
 #include "flock/metrics/manager.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <set>
 
@@ -84,7 +86,7 @@ std::vector<int> LlmRerank::RerankBatch(const nlohmann::json& tuples) {
 }
 
 nlohmann::json LlmRerank::SlidingWindow(nlohmann::json& tuples) {
-    const int num_tuples = static_cast<int>(tuples[0]["data"].size());
+    const int num_tuples = PromptBatcher::RowCount(tuples);
 
     // If there's only 1 tuple, no need to call the LLM - just return it
     if (num_tuples <= 1) {
@@ -106,127 +108,131 @@ nlohmann::json LlmRerank::SlidingWindow(nlohmann::json& tuples) {
     }
 
     auto final_ranked_tuples = nlohmann::json::array();
-    auto carry_forward_tuples = nlohmann::json::array();
+    auto carry_forward_prompt_tuples = nlohmann::json::array();
+    auto carry_forward_output_tuples = nlohmann::json::array();
+    auto prompt_source_tuples = PromptManager::PrepareColumnsForRender(tuples);
     int start_index = 0;
 
-    auto batch_size = std::min<int>(model.GetModelDetails().batch_size, num_tuples);
-
-    if (batch_size <= 0) {
+    const auto model_details = model.GetModelDetails();
+    if (model_details.batch_size <= 0) {
         throw std::runtime_error("Batch size must be greater than zero");
     }
+    const auto max_window_size = std::max(2, model_details.batch_size);
 
-    while (start_index < num_tuples || !carry_forward_tuples.empty()) {
-        auto window_tuples = carry_forward_tuples;
+    while (start_index < num_tuples || !carry_forward_prompt_tuples.empty()) {
+        auto prompt_window_tuples = carry_forward_prompt_tuples;
+        auto output_window_tuples = carry_forward_output_tuples;
 
-        // Then add new tuples up to batch_size
-        // Handle case where carry_forward_tuples is empty (first iteration)
-        int remaining_space = window_tuples.empty()
-                                      ? batch_size
-                                      : (batch_size - static_cast<int>(window_tuples[0]["data"].size()));
-        int end_index = std::min<int>(start_index + remaining_space, num_tuples);
+        const auto carry_count = PromptBatcher::RowCount(prompt_window_tuples);
+        const auto remaining = num_tuples - start_index;
+        const auto remaining_space = std::max(1, max_window_size - carry_count);
+        const auto max_new_tuples = std::min(remaining_space, remaining);
+        int end_index = start_index;
 
-        for (auto i = 0; i < static_cast<int>(tuples.size()); i++) {
-            if (i >= static_cast<int>(window_tuples.size())) {
-                window_tuples.push_back(nlohmann::json::object());
-            }
-            for (const auto& item: tuples[i].items()) {
-                if (item.key() == "data") {
-                    if (!window_tuples[i].contains("data")) {
-                        window_tuples[i]["data"] = nlohmann::json::array();
-                    }
-                    for (int j = start_index; j < end_index; j++) {
-                        window_tuples[i]["data"].push_back(item.value()[j]);
-                    }
-                } else {
-                    window_tuples[i][item.key()] = item.value();
-                }
-            }
+        if (max_new_tuples > 0) {
+            const auto new_tuple_count = PromptBatcher::FindMaxTupleCount(
+                    model_details, max_new_tuples,
+                    [&](int tuple_count) {
+                        auto candidate = prompt_window_tuples;
+                        PromptBatcher::AppendRows(candidate, prompt_source_tuples, start_index, tuple_count);
+                        auto indexed_candidate = PromptBatcher::AddLocalRowIds(candidate);
+                        const auto [prompt, media_data] = PromptManager::Render(
+                                user_query, indexed_candidate, AggregateFunctionType::RERANK, model_details.tuple_format);
+                        (void)media_data;
+                        return prompt;
+                    },
+                    "llm_rerank");
+
+            PromptBatcher::AppendRows(prompt_window_tuples, prompt_source_tuples, start_index, new_tuple_count);
+            PromptBatcher::AppendRows(output_window_tuples, tuples, start_index, new_tuple_count);
+            end_index = start_index + new_tuple_count;
         }
 
         // Clear carry forward for next iteration
-        carry_forward_tuples.clear();
+        carry_forward_prompt_tuples.clear();
+        carry_forward_output_tuples.clear();
 
         // Skip if window_tuples is empty (shouldn't happen, but safety check)
-        if (window_tuples.empty() || window_tuples[0]["data"].empty()) {
+        if (prompt_window_tuples.empty() || prompt_window_tuples[0]["data"].empty()) {
             continue;
         }
 
-        try {
-            // Build indexed tuples with flock_row_id
-            auto indexed_tuples = window_tuples;
-            indexed_tuples.push_back({{"name", "flock_row_id"}, {"data", nlohmann::json::array()}});
-            for (int i = 0; i < static_cast<int>(window_tuples[0]["data"].size()); i++) {
-                indexed_tuples.back()["data"].push_back(std::to_string(i));
-            }
+        auto indexed_tuples = PromptBatcher::AddLocalRowIds(prompt_window_tuples);
+        auto ranked_indices = RerankBatch(indexed_tuples);
 
-            auto ranked_indices = RerankBatch(indexed_tuples);
-
-            // Initialize final_ranked_tuples structure if needed (first time adding results)
-            if (final_ranked_tuples.empty() && !window_tuples.empty()) {
-                for (size_t i = 0; i < window_tuples.size(); i++) {
-                    final_ranked_tuples.push_back(nlohmann::json::object());
-                    // Copy metadata from window_tuples
-                    for (const auto& item: window_tuples[i].items()) {
-                        if (item.key() != "data") {
-                            final_ranked_tuples[i][item.key()] = item.value();
-                        }
+        // Initialize final_ranked_tuples structure if needed (first time adding results)
+        if (final_ranked_tuples.empty() && !output_window_tuples.empty()) {
+            for (size_t i = 0; i < output_window_tuples.size(); i++) {
+                final_ranked_tuples.push_back(nlohmann::json::object());
+                // Copy metadata from window_tuples
+                for (const auto& item: output_window_tuples[i].items()) {
+                    if (item.key() != "data") {
+                        final_ranked_tuples[i][item.key()] = item.value();
                     }
-                    final_ranked_tuples[i]["data"] = nlohmann::json::array();
                 }
+                final_ranked_tuples[i]["data"] = nlohmann::json::array();
             }
+        }
 
-            // Add the bottom half to final results (they won't be re-ranked)
-            int half_batch = static_cast<int>(ranked_indices.size()) / 2;
-            for (int i = half_batch; i < static_cast<int>(ranked_indices.size()); i++) {
-                size_t idx = 0;
-                for (auto& column: window_tuples) {
-                    final_ranked_tuples[idx]["data"].push_back(column["data"][ranked_indices[i]]);
-                    idx++;
-                }
+        // Add the bottom half to final results (they won't be re-ranked)
+        int half_batch = static_cast<int>(ranked_indices.size()) / 2;
+        for (int i = half_batch; i < static_cast<int>(ranked_indices.size()); i++) {
+            size_t idx = 0;
+            for (auto& column: output_window_tuples) {
+                final_ranked_tuples[idx]["data"].push_back(column["data"][ranked_indices[i]]);
+                idx++;
             }
+        }
 
-            // Carry forward top half to next batch for re-ranking
-            // Initialize carry_forward_tuples structure if needed
-            if (carry_forward_tuples.empty() && !window_tuples.empty()) {
-                for (size_t i = 0; i < window_tuples.size(); i++) {
-                    carry_forward_tuples.push_back(nlohmann::json::object());
-                    // Copy metadata from window_tuples
-                    for (const auto& item: window_tuples[i].items()) {
-                        if (item.key() != "data") {
-                            carry_forward_tuples[i][item.key()] = item.value();
-                        }
+        // Carry forward top half to next batch for re-ranking
+        // Initialize carry_forward_tuples structure if needed
+        if (carry_forward_prompt_tuples.empty() && !prompt_window_tuples.empty()) {
+            for (size_t i = 0; i < prompt_window_tuples.size(); i++) {
+                carry_forward_prompt_tuples.push_back(nlohmann::json::object());
+                // Copy metadata from window_tuples
+                for (const auto& item: prompt_window_tuples[i].items()) {
+                    if (item.key() != "data") {
+                        carry_forward_prompt_tuples[i][item.key()] = item.value();
                     }
-                    carry_forward_tuples[i]["data"] = nlohmann::json::array();
                 }
+                carry_forward_prompt_tuples[i]["data"] = nlohmann::json::array();
             }
-            for (int i = 0; i < half_batch; i++) {
-                size_t idx = 0;
-                for (auto& column: window_tuples) {
-                    carry_forward_tuples[idx]["data"].push_back(column["data"][ranked_indices[i]]);
-                    idx++;
-                }
-            }
-
-            start_index = end_index;
-
-            // If we've processed all input tuples, add remaining carry forward to final results
-            if (start_index >= num_tuples && !carry_forward_tuples.empty()) {
-                size_t idx = 0;
-                for (const auto& column: carry_forward_tuples) {
-                    for (const auto& data_item: column["data"]) {
-                        final_ranked_tuples[idx]["data"].push_back(data_item);
+            for (size_t i = 0; i < output_window_tuples.size(); i++) {
+                carry_forward_output_tuples.push_back(nlohmann::json::object());
+                for (const auto& item: output_window_tuples[i].items()) {
+                    if (item.key() != "data") {
+                        carry_forward_output_tuples[i][item.key()] = item.value();
                     }
-                    idx++;
                 }
-                carry_forward_tuples.clear();
+                carry_forward_output_tuples[i]["data"] = nlohmann::json::array();
             }
+        }
+        for (int i = 0; i < half_batch; i++) {
+            size_t idx = 0;
+            for (auto& column: prompt_window_tuples) {
+                carry_forward_prompt_tuples[idx]["data"].push_back(column["data"][ranked_indices[i]]);
+                idx++;
+            }
+            idx = 0;
+            for (auto& column: output_window_tuples) {
+                carry_forward_output_tuples[idx]["data"].push_back(column["data"][ranked_indices[i]]);
+                idx++;
+            }
+        }
 
-        } catch (const ExceededMaxOutputTokensError&) {
-            // Retry the current batch with reduced size
-            batch_size = static_cast<int>(batch_size * 0.9);
-            if (batch_size <= 0) {
-                throw std::runtime_error("Batch size reduced to zero, unable to process tuples");
+        start_index = end_index;
+
+        // If we've processed all input tuples, add remaining carry forward to final results
+        if (start_index >= num_tuples && !carry_forward_output_tuples.empty()) {
+            size_t idx = 0;
+            for (const auto& column: carry_forward_output_tuples) {
+                for (const auto& data_item: column["data"]) {
+                    final_ranked_tuples[idx]["data"].push_back(data_item);
+                }
+                idx++;
             }
+            carry_forward_prompt_tuples.clear();
+            carry_forward_output_tuples.clear();
         }
     }
 

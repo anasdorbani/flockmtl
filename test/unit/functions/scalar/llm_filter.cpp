@@ -3,6 +3,20 @@
 
 namespace flock {
 
+namespace {
+
+size_t CountOccurrences(const std::string& text, const std::string& needle) {
+    size_t count = 0;
+    size_t position = text.find(needle);
+    while (position != std::string::npos) {
+        count++;
+        position = text.find(needle, position + needle.size());
+    }
+    return count;
+}
+
+}// namespace
+
 class LLMFilterTest : public LLMFunctionTestBase<LlmFilter> {
 protected:
     static constexpr const char* EXPECTED_RESPONSE = "true";
@@ -163,6 +177,47 @@ TEST_F(LLMFilterTest, Operation_DefaultBatchSizeSplitsLargeInput) {
     ASSERT_EQ(results->RowCount(), input_count);
     EXPECT_EQ(results->GetValue(0, 0).GetValue<std::string>(), "true");
     EXPECT_EQ(results->GetValue(0, DEFAULT_BATCH_SIZE).GetValue<std::string>(), "false");
+}
+
+TEST_F(LLMFilterTest, Operation_ContextWindowSplitsBeforeBatchSize) {
+    constexpr size_t input_count = 5;
+    const nlohmann::json first_batch_response = {{"items", {true, false}}};
+    const nlohmann::json second_batch_response = {{"items", {true, true}}};
+    const nlohmann::json third_batch_response = {{"items", {false}}};
+
+    PromptTokenizer::SetTokenCounterForTesting([](const std::string& prompt) {
+        return CountOccurrences(prompt, "Content item ");
+    });
+
+    {
+        ::testing::InSequence sequence;
+        EXPECT_CALL(*mock_provider, AddCompletionRequest(::testing::_, 2, ::testing::_, ::testing::_))
+                .Times(1);
+        EXPECT_CALL(*mock_provider, CollectCompletions(::testing::_))
+                .WillOnce(::testing::Return(std::vector<nlohmann::json>{first_batch_response}));
+        EXPECT_CALL(*mock_provider, AddCompletionRequest(::testing::_, 2, ::testing::_, ::testing::_))
+                .Times(1);
+        EXPECT_CALL(*mock_provider, CollectCompletions(::testing::_))
+                .WillOnce(::testing::Return(std::vector<nlohmann::json>{second_batch_response}));
+        EXPECT_CALL(*mock_provider, AddCompletionRequest(::testing::_, 1, ::testing::_, ::testing::_))
+                .Times(1);
+        EXPECT_CALL(*mock_provider, CollectCompletions(::testing::_))
+                .WillOnce(::testing::Return(std::vector<nlohmann::json>{third_batch_response}));
+    }
+
+    auto con = Config::GetConnection();
+    const auto results = con.Query(
+            "SELECT " + GetFunctionName() + "("
+                                        "{'model_name': 'gpt-4o', 'batch_size': 16, 'context_window': 2, 'safe_margin': 0}, "
+                                        "{'prompt': 'Is this relevant?', "
+                                        " 'context_columns': [{'data': 'Content item ' || i::VARCHAR}]}) AS result "
+                                        "FROM range(" +
+            std::to_string(input_count) + ") AS t(i);");
+
+    ASSERT_FALSE(results->HasError()) << "Query failed: " << results->GetError();
+    ASSERT_EQ(results->RowCount(), input_count);
+    EXPECT_EQ(results->GetValue(0, 0).GetValue<std::string>(), "true");
+    EXPECT_EQ(results->GetValue(0, 4).GetValue<std::string>(), "false");
 }
 
 // Test llm_filter with audio transcription

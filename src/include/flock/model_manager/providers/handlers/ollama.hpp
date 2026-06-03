@@ -37,10 +37,11 @@ protected:
         bool is_completion = (request_type == RequestType::Completion);
         if (is_completion) {
             if (response.contains("done_reason") && response["done_reason"] != "stop") {
-                throw std::runtime_error("The request was refused due to some internal error with Ollama API");
+                throw std::runtime_error(ExtractProviderMessage(
+                        response, "Model response did not finish successfully. done_reason: " + response["done_reason"].dump()));
             }
             if (response.contains("done") && !response["done"].is_null() && !response["done"].get<bool>()) {
-                throw std::runtime_error("The request was not completed by Ollama API");
+                throw std::runtime_error(ExtractProviderMessage(response, "Model response was not completed by provider."));
             }
         } else {
             if (response.contains("embeddings") && (!response["embeddings"].is_array() || response["embeddings"].empty())) {

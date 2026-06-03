@@ -3,6 +3,20 @@
 
 namespace flock {
 
+namespace {
+
+size_t CountOccurrences(const std::string& text, const std::string& needle) {
+    size_t count = 0;
+    size_t position = text.find(needle);
+    while (position != std::string::npos) {
+        count++;
+        position = text.find(needle, position + needle.size());
+    }
+    return count;
+}
+
+}// namespace
+
 class LLMCompleteTest : public LLMFunctionTestBase<LlmComplete> {
 protected:
     static constexpr const char* EXPECTED_RESPONSE = "FlockMTL enhances DuckDB by integrating semantic functions and robust resource management capabilities, enabling advanced analytics and language model operations directly within SQL queries.";
@@ -176,6 +190,64 @@ TEST_F(LLMCompleteTest, Operation_LargeInputSet_ProcessesCorrectly) {
         auto expected_value = expected_response["items"][i].get<std::string>();
         EXPECT_EQ(result_value, expected_value);
     }
+}
+
+TEST_F(LLMCompleteTest, Operation_ContextWindowSplitsBeforeBatchSize) {
+    constexpr size_t input_count = 7;
+    const std::vector<nlohmann::json> batch_responses = {
+            PrepareExpectedResponseRange(0, 3),
+            PrepareExpectedResponseRange(3, 3),
+            PrepareExpectedResponseRange(6, 1)};
+
+    PromptTokenizer::SetTokenCounterForTesting([](const std::string& prompt) {
+        return CountOccurrences(prompt, "Input text ");
+    });
+
+    {
+        ::testing::InSequence sequence;
+        EXPECT_CALL(*mock_provider, AddCompletionRequest(::testing::_, 3, ::testing::_, ::testing::_))
+                .Times(1);
+        EXPECT_CALL(*mock_provider, CollectCompletions(::testing::_))
+                .WillOnce(::testing::Return(std::vector<nlohmann::json>{batch_responses[0]}));
+        EXPECT_CALL(*mock_provider, AddCompletionRequest(::testing::_, 3, ::testing::_, ::testing::_))
+                .Times(1);
+        EXPECT_CALL(*mock_provider, CollectCompletions(::testing::_))
+                .WillOnce(::testing::Return(std::vector<nlohmann::json>{batch_responses[1]}));
+        EXPECT_CALL(*mock_provider, AddCompletionRequest(::testing::_, 1, ::testing::_, ::testing::_))
+                .Times(1);
+        EXPECT_CALL(*mock_provider, CollectCompletions(::testing::_))
+                .WillOnce(::testing::Return(std::vector<nlohmann::json>{batch_responses[2]}));
+    }
+
+    auto con = Config::GetConnection();
+    const auto results = con.Query(
+            "SELECT " + GetFunctionName() + "("
+                                        "{'model_name': 'gpt-4o', 'batch_size': 16, 'context_window': 3, 'safe_margin': 0}, "
+                                        "{'prompt': 'Summarize the following text', "
+                                        " 'context_columns': [{'data': 'Input text ' || i::VARCHAR}]}) AS result "
+                                        "FROM range(" +
+            std::to_string(input_count) + ") AS t(i);");
+
+    ASSERT_FALSE(results->HasError()) << "Query failed: " << results->GetError();
+    ASSERT_EQ(results->RowCount(), input_count);
+    EXPECT_EQ(results->GetValue(0, 0).GetValue<std::string>(), "response 0");
+    EXPECT_EQ(results->GetValue(0, 6).GetValue<std::string>(), "response 6");
+}
+
+TEST_F(LLMCompleteTest, Operation_OversizedSingleTupleFailsClearly) {
+    PromptTokenizer::SetTokenCounterForTesting([](const std::string& prompt) {
+        return CountOccurrences(prompt, "Input text ") * 2;
+    });
+
+    auto con = Config::GetConnection();
+    const auto results = con.Query(
+            "SELECT " + GetFunctionName() + "("
+                                        "{'model_name': 'gpt-4o', 'batch_size': 16, 'context_window': 1, 'safe_margin': 0}, "
+                                        "{'prompt': 'Summarize the following text', "
+                                        " 'context_columns': [{'data': 'Input text 0'}]}) AS result;");
+
+    ASSERT_TRUE(results->HasError());
+    EXPECT_THAT(results->GetError(), ::testing::HasSubstr("llm_complete prompt token budget exceeded"));
 }
 
 // Test llm_complete with audio transcription

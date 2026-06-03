@@ -1,6 +1,7 @@
 #include "flock/core/config.hpp"
 #include "flock/functions/aggregate/llm_reduce.hpp"
 #include "flock/functions/llm_function_bind_data.hpp"
+#include "flock/functions/token_budget.hpp"
 #include "flock/metrics/manager.hpp"
 
 #include <chrono>
@@ -32,43 +33,31 @@ nlohmann::json LlmReduce::ReduceLoop(const nlohmann::json& tuples,
     auto batch_tuples = nlohmann::json::array();
     auto summary = nlohmann::json::object({{"Previous Batch Summary", ""}});
     int start_index = 0;
-    int num_tuples = static_cast<int>(tuples[0]["data"].size());
-    auto batch_size = std::min<int>(model.GetModelDetails().batch_size, num_tuples);
+    const auto render_tuples = PromptManager::PrepareColumnsForRender(tuples);
+    int num_tuples = PromptBatcher::RowCount(render_tuples);
+    const auto model_details = model.GetModelDetails();
 
-    if (batch_size <= 0) {
-        throw std::runtime_error("Batch size must be greater than zero");
-    }
+    while (start_index < num_tuples) {
+        const auto max_batch_size = PromptBatcher::EffectiveBatchSize(model_details, num_tuples - start_index);
+        const auto batch_size = PromptBatcher::FindMaxTupleCount(
+                model_details, max_batch_size,
+                [&](int tuple_count) {
+                    auto candidate = PromptBatcher::SliceColumns(render_tuples, start_index, tuple_count);
+                    auto [prompt, media_data] = PromptManager::Render(
+                            user_query, candidate, function_type, model_details.tuple_format);
+                    (void)media_data;
+                    prompt += "\n\n" + summary.dump(4);
+                    return prompt;
+                },
+                "llm_reduce");
 
-    do {
-        for (auto i = 0; i < static_cast<int>(tuples.size()); i++) {
-            batch_tuples.push_back(nlohmann::json::object());
-            for (const auto& item: tuples[i].items()) {
-                if (item.key() == "data") {
-                    batch_tuples[i]["data"] = nlohmann::json::array();
-                    for (auto j = 0; j < batch_size && start_index + j < static_cast<int>(item.value().size()); j++) {
-                        batch_tuples[i]["data"].push_back(item.value()[start_index + j]);
-                    }
-                } else {
-                    batch_tuples[i][item.key()] = item.value();
-                }
-            }
-        }
-
+        batch_tuples = PromptBatcher::SliceColumns(render_tuples, start_index, batch_size);
         start_index += batch_size;
 
-        try {
-            auto response = ReduceBatch(batch_tuples, function_type, summary);
-            batch_tuples.clear();
-            summary = nlohmann::json::object({{"Previous Batch Summary", response}});
-        } catch (const ExceededMaxOutputTokensError&) {
-            start_index -= batch_size;// Retry the current batch with reduced size
-            batch_size = static_cast<int>(batch_size * 0.9);
-            if (batch_size <= 0) {
-                throw std::runtime_error("Batch size reduced to zero, unable to process tuples");
-            }
-        }
-
-    } while (start_index < num_tuples);
+        auto response = ReduceBatch(batch_tuples, function_type, summary);
+        batch_tuples.clear();
+        summary = nlohmann::json::object({{"Previous Batch Summary", response}});
+    }
 
     return summary["Previous Batch Summary"];
 }

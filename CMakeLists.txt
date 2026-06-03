@@ -21,6 +21,27 @@ if(NOT EMSCRIPTEN)
 endif()
 find_package(nlohmann_json CONFIG REQUIRED)
 
+set(FLOCK_DEFAULT_TOKENIZER_PATH
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/tokenizers/cl100k_base/tokenizer.json"
+    CACHE STRING "Path to the bundled default tokenizer.json")
+
+option(FLOCK_USE_TOKENIZERS_CPP "Use mlc-ai/tokenizers-cpp for prompt token counting" ON)
+find_program(FLOCK_CARGO_EXECUTABLE cargo)
+if(FLOCK_USE_TOKENIZERS_CPP AND FLOCK_CARGO_EXECUTABLE)
+    include(FetchContent)
+    set(MLC_ENABLE_SENTENCEPIECE_TOKENIZER OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        tokenizers_cpp
+        GIT_REPOSITORY https://github.com/mlc-ai/tokenizers-cpp.git
+        GIT_TAG v0.1.1
+        GIT_SHALLOW TRUE
+        GIT_SUBMODULES_RECURSE TRUE)
+    FetchContent_MakeAvailable(tokenizers_cpp)
+    set(FLOCK_TOKENIZERS_CPP_ENABLED TRUE)
+elseif(FLOCK_USE_TOKENIZERS_CPP)
+    message(WARNING "cargo was not found; building Flock with the lightweight fallback token counter")
+endif()
+
 # Coverage instrumentation (must be before targets are built)
 if(CMAKE_BUILD_TYPE STREQUAL "Coverage")
     message(STATUS "Enabling code coverage")
@@ -43,12 +64,24 @@ if(NOT EMSCRIPTEN)
     target_link_libraries(${EXTENSION_NAME} CURL::libcurl)
 endif()
 target_link_libraries(${EXTENSION_NAME} nlohmann_json::nlohmann_json)
+target_compile_definitions(${EXTENSION_NAME} PRIVATE
+    FLOCK_DEFAULT_TOKENIZER_PATH="${FLOCK_DEFAULT_TOKENIZER_PATH}")
+if(FLOCK_TOKENIZERS_CPP_ENABLED)
+    target_compile_definitions(${EXTENSION_NAME} PRIVATE FLOCK_ENABLE_TOKENIZERS_CPP)
+    target_link_libraries(${EXTENSION_NAME} tokenizers_cpp)
+endif()
 
 # Link libraries for the loadable extension
 if(NOT EMSCRIPTEN)
     target_link_libraries(${LOADABLE_EXTENSION_NAME} CURL::libcurl)
 endif()
 target_link_libraries(${LOADABLE_EXTENSION_NAME} nlohmann_json::nlohmann_json)
+target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE
+    FLOCK_DEFAULT_TOKENIZER_PATH="${FLOCK_DEFAULT_TOKENIZER_PATH}")
+if(FLOCK_TOKENIZERS_CPP_ENABLED)
+    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE FLOCK_ENABLE_TOKENIZERS_CPP)
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} tokenizers_cpp)
+endif()
 
 # Install the extension
 install(

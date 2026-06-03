@@ -1,6 +1,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "flock/core/config.hpp"
 #include "flock/functions/scalar/llm_embedding.hpp"
+#include "flock/functions/token_budget.hpp"
 #include "flock/metrics/manager.hpp"
 #include "flock/model_manager/model.hpp"
 
@@ -54,17 +55,8 @@ std::vector<duckdb::vector<duckdb::Value>> LlmEmbedding::Operation(duckdb::DataC
         prepared_inputs.push_back(concat_input);
     }
 
-    auto batch_size = model.GetModelDetails().batch_size;
-
-    if (batch_size == 0 || batch_size > prepared_inputs.size()) {
-        batch_size = static_cast<int>(prepared_inputs.size());
-    }
-
-    for (size_t i = 0; i < prepared_inputs.size(); i += batch_size) {
-        std::vector<std::string> batch_inputs;
-        for (size_t j = i; j < i + batch_size && j < prepared_inputs.size(); j++) {
-            batch_inputs.push_back(prepared_inputs[j]);
-        }
+    const auto batches = PromptBatcher::BatchEmbeddingInputs(prepared_inputs, model_details);
+    for (const auto& batch_inputs: batches) {
         model.AddEmbeddingRequest(batch_inputs);
     }
 

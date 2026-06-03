@@ -3,6 +3,20 @@
 
 namespace flock {
 
+namespace {
+
+size_t CountOccurrences(const std::string& text, const std::string& needle) {
+    size_t count = 0;
+    size_t position = text.find(needle);
+    while (position != std::string::npos) {
+        count++;
+        position = text.find(needle, position + needle.size());
+    }
+    return count;
+}
+
+}// namespace
+
 class LLMReduceTest : public LLMAggregateTestBase<LlmReduce> {
 protected:
     static constexpr const char* EXPECTED_RESPONSE = "A comprehensive summary of products.";
@@ -98,6 +112,37 @@ TEST_F(LLMReduceTest, DefaultBatchSizeSplitsLargeInput) {
     const auto results = con.Query(
             "SELECT llm_reduce("
             "{'model_name': 'gpt-4o'}, "
+            "{'prompt': 'Summarize the following product descriptions', 'context_columns': [{'data': description}]}"
+            ") AS product_summary FROM range(" +
+            std::to_string(input_count) + ") AS t(i), "
+                                          "unnest(['Product description ' || i::VARCHAR]) AS products(description);");
+
+    ASSERT_FALSE(results->HasError()) << "Query failed: " << results->GetError();
+    ASSERT_EQ(results->RowCount(), 1);
+    ASSERT_EQ(results->GetValue(0, 0).GetValue<std::string>(), GetExpectedResponse());
+}
+
+TEST_F(LLMReduceTest, ContextWindowSplitsBeforeBatchSize) {
+    constexpr size_t input_count = 5;
+    const nlohmann::json first_batch_response = {{"items", {"Partial summary 1"}}};
+    const nlohmann::json second_batch_response = {{"items", {"Partial summary 2"}}};
+
+    PromptTokenizer::SetTokenCounterForTesting([](const std::string& prompt) {
+        return CountOccurrences(prompt, "Product description ");
+    });
+
+    EXPECT_CALL(*mock_provider, AddCompletionRequest(::testing::_, ::testing::_, ::testing::_, ::testing::_))
+            .Times(3);
+    EXPECT_CALL(*mock_provider, CollectCompletions(::testing::_))
+            .WillOnce(::testing::Return(std::vector<nlohmann::json>{first_batch_response}))
+            .WillOnce(::testing::Return(std::vector<nlohmann::json>{second_batch_response}))
+            .WillOnce(::testing::Return(std::vector<nlohmann::json>{GetExpectedJsonResponse()}));
+
+    auto con = GetConnection();
+
+    const auto results = con.Query(
+            "SELECT llm_reduce("
+            "{'model_name': 'gpt-4o', 'batch_size': 16, 'context_window': 2, 'safe_margin': 0}, "
             "{'prompt': 'Summarize the following product descriptions', 'context_columns': [{'data': description}]}"
             ") AS product_summary FROM range(" +
             std::to_string(input_count) + ") AS t(i), "

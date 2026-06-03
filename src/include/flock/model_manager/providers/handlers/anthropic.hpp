@@ -72,19 +72,13 @@ protected:
             throw std::runtime_error("Anthropic does not support embeddings or transcriptions.");
         }
         if (response.contains("type") && response["type"] == "error") {
-            std::string error_msg = "Anthropic API error";
-            if (response.contains("error") && response["error"].contains("message")) {
-                error_msg = response["error"]["message"].get<std::string>();
-            }
-            throw std::runtime_error("Anthropic API error: " + error_msg);
+            throw std::runtime_error(ExtractProviderMessage(response, "Anthropic request failed"));
         }
         if (response.contains("stop_reason") && !response["stop_reason"].is_null()) {
             std::string stop_reason = response["stop_reason"].get<std::string>();
-            if (stop_reason == "max_tokens") {
-                throw ExceededMaxOutputTokensError();
-            }
             if (stop_reason != "end_turn" && stop_reason != "stop_sequence" && stop_reason != "tool_use") {
-                throw std::runtime_error("Anthropic API unexpected stop_reason: " + stop_reason);
+                throw std::runtime_error(ExtractProviderMessage(
+                        response, "Model response did not finish successfully. stop_reason: " + stop_reason));
             }
         }
     }

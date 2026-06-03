@@ -76,7 +76,7 @@ TEST_F(AnthropicHandlerTest, MaxTokensStopReason) {
     };
 
     EXPECT_EQ(response["stop_reason"], "max_tokens");
-    // This should trigger ExceededMaxOutputTokensError in checkProviderSpecificResponse
+    // This should surface an unfinished-response provider message in checkProviderSpecificResponse.
 }
 
 // Test error response structure

@@ -90,6 +90,18 @@ TEST(ModelParserTest, ParseCreateGlobalModel) {
     EXPECT_EQ(create_stmt->catalog, "flock_storage.");
 }
 
+TEST(ModelParserTest, ParseCreateModelWithContextBudgetArgs) {
+    std::unique_ptr<QueryStatement> statement;
+    ModelParser parser;
+    EXPECT_NO_THROW(parser.Parse("CREATE MODEL ('test_model', 'model_data', 'provider', {\"context_window\": 4096, \"safe_margin\": 256, \"batch_size\": 8})", statement));
+    ASSERT_NE(statement, nullptr);
+    auto create_stmt = dynamic_cast<CreateModelStatement*>(statement.get());
+    ASSERT_NE(create_stmt, nullptr);
+    EXPECT_EQ(create_stmt->model_args["context_window"], 4096);
+    EXPECT_EQ(create_stmt->model_args["safe_margin"], 256);
+    EXPECT_EQ(create_stmt->model_args["batch_size"], 8);
+}
+
 TEST(ModelParserTest, ParseCreateGlobalModelWithSemicolon) {
     std::unique_ptr<QueryStatement> statement;
     ModelParser parser;
@@ -248,6 +260,14 @@ TEST(ModelParserTest, ParseStringBatchSizeCreateModel) {
     EXPECT_THROW(parser.Parse("CREATE MODEL ('test_model', 'model_data', 'provider', {\"tuple_format\": \"json\", \"batch_size\": \"32\", \"model_parameters\": {\"param1\": \"value1\"}})", statement), std::runtime_error);
 }
 
+TEST(ModelParserTest, ParseInvalidContextBudgetCreateModel) {
+    std::unique_ptr<QueryStatement> statement;
+    ModelParser parser;
+    EXPECT_THROW(parser.Parse("CREATE MODEL ('test_model', 'model_data', 'provider', {\"context_window\": \"4096\"})", statement), std::runtime_error);
+    EXPECT_THROW(parser.Parse("CREATE MODEL ('test_model', 'model_data', 'provider', {\"context_window\": 512, \"safe_margin\": 512})", statement), std::runtime_error);
+    EXPECT_THROW(parser.Parse("CREATE MODEL ('test_model', 'model_data', 'provider', {\"safe_margin\": -1})", statement), std::runtime_error);
+}
+
 TEST(ModelParserTest, ParseStringBatchSizeCreateModelWithComment) {
     std::unique_ptr<QueryStatement> statement;
     ModelParser parser;
@@ -388,6 +408,17 @@ TEST(ModelParserTest, ParseUpdateModel) {
     EXPECT_EQ(update_stmt->new_model_args["tuple_format"], "xml");
     EXPECT_EQ(update_stmt->new_model_args["batch_size"], 64);
     EXPECT_EQ(update_stmt->new_model_args["model_parameters"].at("param2"), "value2");
+}
+
+TEST(ModelParserTest, ParseUpdateModelWithContextBudgetArgs) {
+    std::unique_ptr<QueryStatement> statement;
+    ModelParser parser;
+    EXPECT_NO_THROW(parser.Parse("UPDATE MODEL ('test_model', 'new_model_data', 'new_provider', {\"context_window\": 16384, \"safe_margin\": 1024})", statement));
+    ASSERT_NE(statement, nullptr);
+    const auto update_stmt = dynamic_cast<UpdateModelStatement*>(statement.get());
+    ASSERT_NE(update_stmt, nullptr);
+    EXPECT_EQ(update_stmt->new_model_args["context_window"], 16384);
+    EXPECT_EQ(update_stmt->new_model_args["safe_margin"], 1024);
 }
 
 TEST(ModelParserTest, ParseUpdateModelWithSemicolon) {
@@ -562,6 +593,13 @@ TEST(ModelParserTest, ParseStringBatchSizeUpdateModel) {
     std::unique_ptr<QueryStatement> statement;
     ModelParser parser;
     EXPECT_THROW(parser.Parse("UPDATE MODEL ('test_model', 'new_model_data', 'new_provider', {\"tuple_format\": \"xml\", \"batch_size\": \"64\", \"model_parameters\": {\"param2\": \"value2\"}})", statement), std::runtime_error);
+}
+
+TEST(ModelParserTest, ParseInvalidContextBudgetUpdateModel) {
+    std::unique_ptr<QueryStatement> statement;
+    ModelParser parser;
+    EXPECT_THROW(parser.Parse("UPDATE MODEL ('test_model', 'new_model_data', 'new_provider', {\"safe_margin\": \"512\"})", statement), std::runtime_error);
+    EXPECT_THROW(parser.Parse("UPDATE MODEL ('test_model', 'new_model_data', 'new_provider', {\"context_window\": 128, \"safe_margin\": 256})", statement), std::runtime_error);
 }
 
 TEST(ModelParserTest, ParseStringBatchSizeUpdateModelWithComment) {

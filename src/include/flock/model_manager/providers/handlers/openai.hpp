@@ -62,8 +62,9 @@ protected:
                 const auto& choice = response["choices"][0];
                 if (choice.contains("finish_reason") && !choice["finish_reason"].is_null()) {
                     std::string finish_reason = choice["finish_reason"].get<std::string>();
-                    if (finish_reason != "stop" && finish_reason != "length") {
-                        throw std::runtime_error("OpenAI API did not finish successfully. finish_reason: " + finish_reason);
+                    if (finish_reason != "stop") {
+                        throw std::runtime_error(ExtractProviderMessage(
+                                response, "Model response did not finish successfully. finish_reason: " + finish_reason));
                     }
                 }
             }

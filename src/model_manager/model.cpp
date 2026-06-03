@@ -14,6 +14,35 @@ bool is_base64(const std::string& str) {
     return std::regex_match(str, base64_regex);
 }
 
+namespace {
+
+int ResolveIntSetting(const nlohmann::json& model_json,
+                      const nlohmann::json& db_model_args,
+                      const std::string& key,
+                      int default_value) {
+    if (model_json.contains(key)) {
+        return model_json.at(key).get<int>();
+    }
+    if (db_model_args.contains(key)) {
+        return db_model_args.at(key).get<int>();
+    }
+    return default_value;
+}
+
+void ValidateContextBudget(const ModelDetails& details) {
+    if (details.context_window <= 0) {
+        throw std::invalid_argument("`context_window` must be greater than zero");
+    }
+    if (details.safe_margin < 0) {
+        throw std::invalid_argument("`safe_margin` must be greater than or equal to zero");
+    }
+    if (details.context_window <= details.safe_margin) {
+        throw std::invalid_argument("`context_window` must be greater than `safe_margin`");
+    }
+}
+
+}// namespace
+
 Model::Model(const nlohmann::json& model_json) {
     LoadModelDetails(model_json);
     ConstructProvider();
@@ -39,6 +68,12 @@ void Model::LoadModelDetails(const nlohmann::json& model_json) {
         model_details_.secret = model_json["secret"].get<std::unordered_map<std::string, std::string>>();
         model_details_.tuple_format = model_json.at("tuple_format").get<std::string>();
         model_details_.batch_size = model_json.at("batch_size").get<int>();
+        model_details_.context_window = model_json.contains("context_window")
+                                                ? model_json.at("context_window").get<int>()
+                                                : DEFAULT_CONTEXT_WINDOW;
+        model_details_.safe_margin = model_json.contains("safe_margin")
+                                             ? model_json.at("safe_margin").get<int>()
+                                             : DEFAULT_SAFE_MARGIN;
 
         if (model_json.contains("model_parameters")) {
             auto& mp = model_json.at("model_parameters");
@@ -89,7 +124,12 @@ void Model::LoadModelDetails(const nlohmann::json& model_json) {
         } else {
             model_details_.batch_size = DEFAULT_BATCH_SIZE;
         }
+
+        model_details_.context_window = ResolveIntSetting(model_json, db_model_args, "context_window", DEFAULT_CONTEXT_WINDOW);
+        model_details_.safe_margin = ResolveIntSetting(model_json, db_model_args, "safe_margin", DEFAULT_SAFE_MARGIN);
     }
+
+    ValidateContextBudget(model_details_);
 }
 
 std::tuple<std::string, std::string, nlohmann::basic_json<>> Model::GetQueriedModel(const std::string& model_name) {
@@ -163,6 +203,8 @@ nlohmann::json Model::GetModelDetailsAsJson() const {
     result["provider"] = model_details_.provider_name;
     result["tuple_format"] = model_details_.tuple_format;
     result["batch_size"] = model_details_.batch_size;
+    result["context_window"] = model_details_.context_window;
+    result["safe_margin"] = model_details_.safe_margin;
     result["secret"] = model_details_.secret;
     if (!model_details_.model_parameters.empty()) {
         result["model_parameters"] = model_details_.model_parameters;

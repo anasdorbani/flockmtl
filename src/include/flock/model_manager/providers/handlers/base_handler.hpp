@@ -239,18 +239,10 @@ protected:
                     try {
                         results[i] = ExtractOutput(parsed, request_type);
                     } catch (const std::exception& e) {
-                        std::string msg = e.what();
-                        if (msg.rfind("[ModelProvider]", 0) == 0) {
-                            throw;
-                        }
-                        trigger_error(std::string("Output extraction error: ") + msg);
+                        trigger_error(e.what());
                     }
                 } catch (const std::exception& e) {
-                    std::string msg = e.what();
-                    if (msg.rfind("[ModelProvider]", 0) == 0) {
-                        throw;
-                    }
-                    trigger_error(std::string("Response processing error: ") + msg);
+                    trigger_error(e.what());
                 }
             } else {
                 trigger_error("Invalid JSON response (HTTP " + std::to_string(http_code) + ", URL: " + url + "): " + requests[i].response);
@@ -307,40 +299,46 @@ protected:
     }
     virtual std::pair<int64_t, int64_t> ExtractTokenUsage(const nlohmann::json& response) const = 0;
 
-    void trigger_error(const std::string& msg) {
-        const std::string prefix = "[ModelProvider] ";
-        std::string full_message;
-        if (msg.rfind(prefix, 0) == 0) {
-            full_message = msg;
-        } else {
-            full_message = prefix + msg;
+    static std::string ExtractProviderMessage(const nlohmann::json& json, const std::string& fallback) {
+        if (json.contains("error")) {
+            const auto& err = json["error"];
+            if (err.is_object()) {
+                if (err.contains("message") && err["message"].is_string()) {
+                    return err["message"].get<std::string>();
+                }
+                if (err.contains("detail") && err["detail"].is_string()) {
+                    return err["detail"].get<std::string>();
+                }
+                if (err.contains("type") && err["type"].is_string()) {
+                    return err["type"].get<std::string>() + ": " + err.dump();
+                }
+                return err.dump();
+            }
+            if (err.is_string()) {
+                return err.get<std::string>();
+            }
+            return err.dump();
         }
+        if (json.contains("message") && json["message"].is_string()) {
+            return json["message"].get<std::string>();
+        }
+        if (json.contains("detail") && json["detail"].is_string()) {
+            return json["detail"].get<std::string>();
+        }
+        return fallback;
+    }
 
+    void trigger_error(const std::string& msg) {
         if (_throw_exception) {
-            throw std::runtime_error(full_message);
+            throw std::runtime_error(msg);
         } else {
-            std::cerr << full_message << '\n';
+            std::cerr << msg << '\n';
         }
     }
 
     void checkResponse(const nlohmann::json& json, RequestType request_type) {
         if (json.contains("error")) {
-            const auto& err = json["error"];
-            std::string reason;
-
-            if (err.is_object()) {
-                if (err.contains("message") && err["message"].is_string()) {
-                    reason = err["message"].get<std::string>();
-                } else {
-                    reason = err.dump();
-                }
-            } else if (err.is_string()) {
-                reason = err.get<std::string>();
-            } else {
-                reason = err.dump();
-            }
-
-            trigger_error("Provider error: " + reason);
+            trigger_error(ExtractProviderMessage(json, "Provider request failed"));
             std::cerr << ">> response error :\n"
                       << json.dump(2) << "\n";
         }

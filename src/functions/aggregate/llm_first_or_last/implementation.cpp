@@ -1,8 +1,10 @@
 #include "flock/core/config.hpp"
 #include "flock/functions/aggregate/llm_first_or_last.hpp"
 #include "flock/functions/llm_function_bind_data.hpp"
+#include "flock/functions/token_budget.hpp"
 #include "flock/metrics/manager.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <set>
 
@@ -65,7 +67,7 @@ int LlmFirstOrLast::GetFirstOrLastTupleId(nlohmann::json& tuples) {
 }
 
 nlohmann::json LlmFirstOrLast::Evaluate(nlohmann::json& tuples) {
-    int num_tuples = static_cast<int>(tuples[0]["data"].size());
+    int num_tuples = PromptBatcher::RowCount(tuples);
 
     if (num_tuples <= 1) {
         auto result = nlohmann::json::array();
@@ -85,62 +87,47 @@ nlohmann::json LlmFirstOrLast::Evaluate(nlohmann::json& tuples) {
         return result;
     }
 
-    auto batch_tuples = nlohmann::json::array();
+    auto prompt_source_tuples = PromptManager::PrepareColumnsForRender(tuples);
+    auto prompt_batch_tuples = nlohmann::json::array();
+    int selected_result_idx = 0;
     int start_index = 0;
-    auto batch_size = std::min<int>(model.GetModelDetails().batch_size, num_tuples);
-
-    if (batch_size <= 0) {
+    const auto model_details = model.GetModelDetails();
+    if (model_details.batch_size <= 0) {
         throw std::runtime_error("Batch size must be greater than zero");
     }
+    const auto max_window_size = std::max(2, model_details.batch_size);
 
-    do {
-        for (auto i = 0; i < static_cast<int>(tuples.size()); i++) {
-            if (start_index == 0) {
-                batch_tuples.push_back(nlohmann::json::object());
-            }
-            for (const auto& item: tuples[i].items()) {
-                if (item.key() == "data") {
-                    for (auto j = 0; j < batch_size && start_index + j < static_cast<int>(item.value().size()); j++) {
-                        if (start_index == 0 && j == 0) {
-                            batch_tuples[i]["data"] = nlohmann::json::array();
-                        }
-                        batch_tuples[i]["data"].push_back(item.value()[start_index + j]);
-                    }
-                } else {
-                    batch_tuples[i][item.key()] = item.value();
-                }
-            }
-        }
+    while (start_index < num_tuples) {
+        const auto carry_count = PromptBatcher::RowCount(prompt_batch_tuples);
+        const auto remaining = num_tuples - start_index;
+        const auto remaining_space = std::max(1, max_window_size - carry_count);
+        const auto max_new_tuples = std::min(remaining_space, remaining);
 
-        start_index += batch_size;
+        const auto new_tuple_count = PromptBatcher::FindMaxTupleCount(
+                model_details, max_new_tuples,
+                [&](int tuple_count) {
+                    auto candidate = prompt_batch_tuples;
+                    PromptBatcher::AppendRows(candidate, prompt_source_tuples, start_index, tuple_count);
+                    const auto [prompt, media_data] = PromptManager::Render(
+                            user_query, candidate, function_type, model_details.tuple_format);
+                    (void)media_data;
+                    return prompt;
+                },
+                function_type == AggregateFunctionType::FIRST ? "llm_first" : "llm_last");
 
-        try {
-            auto result_idx = GetFirstOrLastTupleId(batch_tuples);
+        auto candidate_tuples = prompt_batch_tuples;
+        PromptBatcher::AppendRows(candidate_tuples, prompt_source_tuples, start_index, new_tuple_count);
+        start_index += new_tuple_count;
 
-            batch_tuples.clear();
-            for (auto i = 0; i < static_cast<int>(tuples.size()); i++) {
-                batch_tuples.push_back(nlohmann::json::object());
-                for (const auto& item: tuples[i].items()) {
-                    if (item.key() == "data") {
-                        batch_tuples[i]["data"] = nlohmann::json::array();
-                        batch_tuples[i]["data"].push_back(item.value()[result_idx]);
-                    } else {
-                        batch_tuples[i][item.key()] = item.value();
-                    }
-                }
-            }
-        } catch (const ExceededMaxOutputTokensError&) {
-            start_index -= batch_size;
-            batch_size = static_cast<int>(batch_size * 0.9);
-            if (batch_size <= 0) {
-                throw std::runtime_error("Batch size reduced to zero, unable to process tuples");
-            }
-        }
+        auto result_idx = GetFirstOrLastTupleId(candidate_tuples);
+        selected_result_idx = result_idx;
+        prompt_batch_tuples = PromptBatcher::SliceColumns(prompt_source_tuples, result_idx, 1);
 
-    } while (start_index < static_cast<int>(tuples[0]["data"].size()));
+    }
 
     auto result_tuples = nlohmann::json::array();
-    for (const auto& column: batch_tuples) {
+    auto selected_output_tuples = PromptBatcher::SliceColumns(tuples, selected_result_idx, 1);
+    for (const auto& column: selected_output_tuples) {
         if (column.contains("name") && column["name"].is_string() &&
             column["name"].get<std::string>() == "flock_row_id") {
             continue;

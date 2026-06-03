@@ -4,6 +4,20 @@
 
 namespace flock {
 
+namespace {
+
+size_t CountOccurrences(const std::string& text, const std::string& needle) {
+    size_t count = 0;
+    size_t position = text.find(needle);
+    while (position != std::string::npos) {
+        count++;
+        position = text.find(needle, position + needle.size());
+    }
+    return count;
+}
+
+}// namespace
+
 class LLMEmbeddingTest : public LLMFunctionTestBase<LlmEmbedding> {
 protected:
     // Expected embedding response - typical dimension for embeddings
@@ -188,6 +202,42 @@ TEST_F(LLMEmbeddingTest, Operation_DefaultBatchSizeSplitsLargeInput) {
     ASSERT_EQ(results->RowCount(), input_count);
     ASSERT_EQ(results->GetValue(0, 0).type().id(), duckdb::LogicalTypeId::LIST);
     ASSERT_EQ(results->GetValue(0, DEFAULT_BATCH_SIZE).type().id(), duckdb::LogicalTypeId::LIST);
+}
+
+TEST_F(LLMEmbeddingTest, Operation_ContextWindowSplitsBeforeBatchSize) {
+    constexpr size_t input_count = 5;
+    nlohmann::json expected_response = nlohmann::json::array();
+    for (size_t i = 0; i < input_count; i++) {
+        expected_response.push_back(std::vector<double>{0.01 * static_cast<double>(i), 0.2, 0.3});
+    }
+
+    PromptTokenizer::SetTokenCounterForTesting([](const std::string& input) {
+        return CountOccurrences(input, "Document content number");
+    });
+
+    {
+        ::testing::InSequence sequence;
+        EXPECT_CALL(*mock_provider, AddEmbeddingRequest(::testing::SizeIs(2)))
+                .Times(1);
+        EXPECT_CALL(*mock_provider, AddEmbeddingRequest(::testing::SizeIs(2)))
+                .Times(1);
+        EXPECT_CALL(*mock_provider, AddEmbeddingRequest(::testing::SizeIs(1)))
+                .Times(1);
+    }
+    EXPECT_CALL(*mock_provider, CollectEmbeddings(::testing::_))
+            .WillOnce(::testing::Return(std::vector<nlohmann::json>{expected_response}));
+
+    auto con = Config::GetConnection();
+    const auto results = con.Query(
+            "SELECT " + GetFunctionName() + "("
+                                        "{'model_name': 'text-embedding-3-small', 'batch_size': 16, 'context_window': 2, 'safe_margin': 0}, "
+                                        "{'context_columns': [{'data': content}]}"
+                                        ") AS embedding FROM range(" +
+            std::to_string(input_count) + ") AS t(i), unnest(['Document content number ' || i::VARCHAR]) AS tbl(content);");
+
+    ASSERT_FALSE(results->HasError()) << "Query failed: " << results->GetError();
+    ASSERT_EQ(results->RowCount(), input_count);
+    ASSERT_EQ(results->GetValue(0, 4).type().id(), duckdb::LogicalTypeId::LIST);
 }
 
 }// namespace flock

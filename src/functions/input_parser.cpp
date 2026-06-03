@@ -77,9 +77,9 @@ nlohmann::json CastVectorOfStructsToJson(const duckdb::Vector& struct_vector, co
                         struct_json["context_columns"][context_column_idx]["data"].push_back(context_column_json["data"]);
                     }
                 }
-            } else if (key == "batch_size") {
+            } else if (key == "batch_size" || key == "context_window" || key == "safe_margin") {
                 if (value.GetTypeMutable() != duckdb::LogicalType::INTEGER) {
-                    throw std::runtime_error("Expected 'batch_size' to be an integer.");
+                    throw std::runtime_error(duckdb_fmt::format("Expected '{}' to be an integer.", key));
                 }
                 struct_json[key] = value.GetValue<int>();
             } else {

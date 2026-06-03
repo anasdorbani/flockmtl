@@ -3,6 +3,20 @@
 
 namespace flock {
 
+namespace {
+
+size_t CountOccurrences(const std::string& text, const std::string& needle) {
+    size_t count = 0;
+    size_t position = text.find(needle);
+    while (position != std::string::npos) {
+        count++;
+        position = text.find(needle, position + needle.size());
+    }
+    return count;
+}
+
+}// namespace
+
 class LLMLastTest : public LLMAggregateTestBase<LlmFirstOrLast> {
 protected:
     static constexpr const char* LLM_RESPONSE = R"({"items":[2]})";
@@ -79,6 +93,39 @@ TEST_F(LLMLastTest, MultipleTuplesWithoutGroupBy) {
     ASSERT_FALSE(results->HasError()) << "Query failed: " << results->GetError();
     ASSERT_EQ(results->RowCount(), 1);
     ASSERT_EQ(results->GetValue(0, 0).GetValue<std::string>(), GetExpectedResponse());
+}
+
+TEST_F(LLMLastTest, ContextWindowSplitsBeforeBatchSize) {
+    constexpr size_t input_count = 4;
+    const nlohmann::json response_id_1 = nlohmann::json{{"items", {1}}};
+    const nlohmann::json response_id_2 = nlohmann::json{{"items", {2}}};
+    const nlohmann::json response_id_3 = nlohmann::json{{"items", {3}}};
+
+    PromptTokenizer::SetTokenCounterForTesting([](const std::string& prompt) {
+        return CountOccurrences(prompt, "Product description ");
+    });
+
+    EXPECT_CALL(*mock_provider, AddCompletionRequest(::testing::_, 1, ::testing::_, ::testing::_))
+            .Times(3);
+    EXPECT_CALL(*mock_provider, CollectCompletions(::testing::_))
+            .WillOnce(::testing::Return(std::vector<nlohmann::json>{response_id_1}))
+            .WillOnce(::testing::Return(std::vector<nlohmann::json>{response_id_2}))
+            .WillOnce(::testing::Return(std::vector<nlohmann::json>{response_id_3}));
+
+    auto con = GetConnection();
+
+    const auto results = con.Query(
+            "SELECT llm_last("
+            "{'model_name': 'gpt-4o', 'batch_size': 16, 'context_window': 2, 'safe_margin': 0}, "
+            "{'prompt': 'What is the least relevant product?', 'context_columns': [{'data': description}]}"
+            ") AS last_product FROM range(" +
+            std::to_string(input_count) + ") AS t(i), "
+                                          "unnest(['Product description ' || i::VARCHAR]) AS products(description);");
+
+    ASSERT_FALSE(results->HasError()) << "Query failed: " << results->GetError();
+    ASSERT_EQ(results->RowCount(), 1);
+    nlohmann::json parsed = nlohmann::json::parse(results->GetValue(0, 0).GetValue<std::string>());
+    EXPECT_EQ(parsed[0]["data"][0], "Product description 3");
 }
 
 // Test GROUP BY with multiple tuples per group: LLM is called for each group

@@ -275,4 +275,20 @@ nlohmann::json PromptManager::TranscribeAudioColumn(const nlohmann::json& audio_
     return transcription_column;
 }
 
+nlohmann::json PromptManager::PrepareColumnsForRender(const nlohmann::json& columns) {
+    auto prepared_columns = nlohmann::json::array();
+
+    for (const auto& column: columns) {
+        if (column.contains("type") && column["type"].is_string() &&
+            column["type"].get<std::string>() == "audio" &&
+            column.contains("transcription_model")) {
+            prepared_columns.push_back(TranscribeAudioColumn(column));
+        } else {
+            prepared_columns.push_back(column);
+        }
+    }
+
+    return prepared_columns;
+}
+
 }// namespace flock
